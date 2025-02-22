@@ -1,4 +1,5 @@
 import os
+from dotenv import load_dotenv
 import functools
 import logging
 import warnings
@@ -20,7 +21,21 @@ from huggingface_hub import login
 from datasets import load_dataset
 
 from cycling_utils import atomic_torch_save, AtomicDirectory, TimestampedTimer, InterruptableDistributedSampler
+
+import argparse
 from fsdp_utils import bfSixteen_ready, bfSixteen_policy, count_trainable_parameters, AppState, get_args_parser
+
+# Hardcoded token (VERY BAD PRACTICE - ONLY FOR EXTREME SHORT-TERM POC)
+HF_TOKEN = "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"  # Replace with your actual token
+
+login(token=HF_TOKEN)  # Log in immediately
+
+# load_dotenv()  # Load environment variables from .env
+# hf_token = os.environ.get("HF_TOKEN") 
+# if hf_token:
+#     login(token=hf_token)
+# else:
+#     raise ValueError("HF_TOKEN not found in .env file")
 
 timer = TimestampedTimer("Start")
 
@@ -123,17 +138,14 @@ class FunctionCallingDataset(Dataset):
         }
 
 if __name__ == "__main__":
-    args = get_args_parser().parse_args()
+    parser = get_args_parser() # Get the parser object
+    args = parser.parse_args()  # Parse the arguments using the parser object
+
     rank = int(os.environ["RANK"]) # Global rank
     local_device = int(os.environ["LOCAL_RANK"]) # Rank on local node
     world_size = int(os.environ["WORLD_SIZE"]) # Total number of global ranks
     model_path = os.path.join("/data", args.dataset_id)
     torch.cuda.set_device(local_device)
-
-    # Set up HuggingFace authentication
-    if rank == 0:  # Only needed on main rank
-        os.environ['HF_TOKEN'] = "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"  # Replace with actual token
-        login(token=os.environ['HF_TOKEN'])
 
     timer.report(f"Init process group for world size: {world_size}")
 
@@ -192,29 +204,24 @@ if __name__ == "__main__":
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
 
     # Load and prepare the dataset
-    if rank == 0:  # Only load dataset on main rank
-        raw_dataset = load_dataset(
-            "Salesforce/xlam-function-calling-60k",
-            token=os.environ['HF_TOKEN'],
-            verification_mode="no_checks",
-            data_files="xlam_function_calling_60k.json"
-        )
-        train_dataset = raw_dataset["train"]
-    else:
-        train_dataset = None
+    raw_dataset = load_dataset(
+    "Salesforce/xlam-function-calling-60k",
+    token=HF_TOKEN,
+    # token=os.environ['HF_TOKEN'],
+    verification_mode="no_checks",
+    data_files="xlam_function_calling_60k.json",
+    streaming=True
+    )
 
-    # Broadcast dataset to all ranks
-    if world_size > 1:
-        train_dataset = torch.distributed.broadcast_object_list([train_dataset if rank == 0 else None], src=0)[0]
+    train_dataset = raw_dataset["train"].shard(num_shards=world_size, index=rank) # Sharding
 
-    # Create custom dataset
     dataset = FunctionCallingDataset(train_dataset, tokenizer)
-    
+
     train_sampler = InterruptableDistributedSampler(dataset)
 
-    batch_size = 4
+    batch_size = 2
     dataloader = DataLoader(
-        dataset,
+        dataset,  # Use the dataset created on each rank
         batch_size=batch_size,
         collate_fn=lambda x: {
             'input_ids': torch.stack([s['input_ids'] for s in x]),

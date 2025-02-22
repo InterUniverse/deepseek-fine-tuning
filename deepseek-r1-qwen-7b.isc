@@ -1,12 +1,15 @@
-isc_project_id = "<project-id>"
+isc_project_id = "88c89dca-ddc7-4886-a48d-ef692d369a3d"
 experiment_name = "deepseek-r1-qwen-7b"
-gpus = 8
-compute_mode = "cycle"
+gpus = 48
+gpu_type="24GB VRAM GPU"
+compute_mode = "burst"
 dataset_id_list = ["a792646c-39f5-4971-a169-425324fec87b"]
+burst_shape_priority_list = ["aws-useast1-l4-spot", "aws-euwest1-a10g-spot", "aws-apsoutheast2-a10g-spot", "aws-uswest2-l4-spot", "aws-useast1-a10g-spot", "aws-useast2-a10g-spot", "aws-useast2-l4-spot", "aws-uswest2-a10g-spot"]
+input_artifact_id_list=["25af3f5c-f165-4146-a571-498212ae0cc5"]
 command = '''
 source /root/.deepseek/bin/activate && 
 torchrun --nnodes=$NNODES --nproc-per-node=$N_PROC 
 --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT --node_rank=$RANK 
-/root/isc-demos/deepseek/fsdp.py 
+/root/deepseek-fine-tuning/fsdp.py
 --dataset-id a792646c-39f5-4971-a169-425324fec87b
 --chk-path $OUTPUT_PATH'''

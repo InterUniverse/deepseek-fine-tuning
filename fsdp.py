@@ -1,9 +1,7 @@
 import os
-from dotenv import load_dotenv
 import functools
 import logging
 import warnings
-import json
 
 import torch
 import torch.distributed as dist
@@ -13,29 +11,15 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import ShardingStrategy
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
 from torch.distributed.fsdp.fully_sharded_data_parallel import CPUOffload
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import LoraModel, LoraConfig
-from huggingface_hub import login
+
 from datasets import load_dataset
 
 from cycling_utils import atomic_torch_save, AtomicDirectory, TimestampedTimer, InterruptableDistributedSampler
-
-import argparse
 from fsdp_utils import bfSixteen_ready, bfSixteen_policy, count_trainable_parameters, AppState, get_args_parser
-
-# Hardcoded token (VERY BAD PRACTICE - ONLY FOR EXTREME SHORT-TERM POC)
-HF_TOKEN = "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"  # Replace with your actual token
-
-login(token=HF_TOKEN)  # Log in immediately
-
-# load_dotenv()  # Load environment variables from .env
-# hf_token = os.environ.get("HF_TOKEN") 
-# if hf_token:
-#     login(token=hf_token)
-# else:
-#     raise ValueError("HF_TOKEN not found in .env file")
 
 timer = TimestampedTimer("Start")
 
@@ -48,99 +32,19 @@ warnings.filterwarnings("ignore", category=UserWarning)
 ADAPTER_NAME = "ExampleLora"
 SHARD_STRATEGY = ShardingStrategy.FULL_SHARD
 
-def build_prompt_and_response(sample):
-    """
-    Given a single sample from the xlam-function-calling-60k dataset,
-    return (input_text, target_text) strings suitable for training.
-    """
-    try:
-        # Convert sample to dict if it's not already
-        sample_dict = dict(sample)
-        
-        query = sample_dict["query"]
-        tools = sample_dict["tools"]
-        answers = sample_dict["answers"]
+'''
+For Hybrid shard we need to:
+1. Initialize the device_mesh as an (NNODES, NPROC) array.
+2. Set SHARD_STRATEGY = ShardingStrategy.HYBRID_SHARD
+3. Enumerate processes within one model shard group to participate in saving - HOW??
+4. Gate saving on being member of that group
+5. Pass the saving process group to the dcp.save function
+'''
 
-        # Ensure tools is a list of dictionaries
-        if isinstance(tools, str):
-            tools = json.loads(tools)
-        
-        # Get tool names
-        tool_names = [t["name"] if isinstance(t, dict) else t for t in tools]
-        tools_str = ", ".join(tool_names) if tool_names else "No tools listed"
-
-        input_text = (
-            "You are a helpful reasoning model that can call tools by returning JSON. "
-            "Below is the user's query. You can use these tools:\n"
-            f"{tools_str}\n\n"
-            f"User Query: {query}\n"
-            "Return the correct function call(s) in valid JSON. If multiple calls are needed, "
-            "return them as a JSON array. Do not include extraneous text outside the JSON.\n"
-        )
-
-        chain_of_thought = (
-            "<think>Step-by-step reasoning about how to handle the user's query.</think>"
-        )
-
-        # Ensure answers is in the correct format for JSON serialization
-        if isinstance(answers, str):
-            answers = json.loads(answers)
-
-        answers_json_str = json.dumps(answers, ensure_ascii=False)
-        target_text = f"{chain_of_thought}\n\n{answers_json_str}"
-
-        return input_text, target_text
-    
-    except Exception as e:
-        print(f"Error processing sample: {e}")
-        return None, None
-
-class FunctionCallingDataset(Dataset):
-    def __init__(self, dataset, tokenizer, max_length=512):
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.samples = []
-        
-        for sample in dataset:
-            input_text, target_text = build_prompt_and_response(sample)
-            if input_text is not None and target_text is not None:
-                self.samples.append({
-                    "input_text": input_text,
-                    "target_text": target_text
-                })
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        sample = self.samples[idx]
-        
-        # Combine input and target for causal LM training
-        full_text = f"{sample['input_text']}{sample['target_text']}"
-        
-        encodings = self.tokenizer(
-            full_text,
-            truncation=True,
-            max_length=self.max_length,
-            padding="max_length",
-            return_tensors="pt"
-        )
-        
-        # Create labels (shift input_ids right)
-        input_ids = encodings["input_ids"].squeeze()
-        attention_mask = encodings["attention_mask"].squeeze()
-        labels = input_ids.clone()
-        
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels
-        }
+print("Finished imports")
 
 if __name__ == "__main__":
-    parser = get_args_parser() # Get the parser object
-    args = parser.parse_args()  # Parse the arguments using the parser object
-
+    args = get_args_parser().parse_args()
     rank = int(os.environ["RANK"]) # Global rank
     local_device = int(os.environ["LOCAL_RANK"]) # Rank on local node
     world_size = int(os.environ["WORLD_SIZE"]) # Total number of global ranks
@@ -149,12 +53,15 @@ if __name__ == "__main__":
 
     timer.report(f"Init process group for world size: {world_size}")
 
+    # creating a device mesh enables FSDP to use DTensor instead of ShardedTensor
     device_mesh = init_device_mesh("cuda", (world_size,))
-    saving_group = device_mesh.get_group()
+    saving_group = device_mesh.get_group() # modify this for HYBRID_SHARD
     assert bfSixteen_ready(), "ERROR: System not BF16 ready."
 
+    # pre-trained model weights should be mounted at /data
     tokenizer = AutoTokenizer.from_pretrained(model_path)
 
+    # save CPU RAM by loading non-main rank models to 'meta' device
     if rank == 0:
         model = AutoModelForCausalLM.from_pretrained(
             model_path, 
@@ -173,17 +80,19 @@ if __name__ == "__main__":
 
     timer.report(f"Loaded model: {count_trainable_parameters(model)}")
 
+    # inject PEFT modules
     lora_config = LoraConfig(
         r=16,
         lora_alpha=32,
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-        lora_dropout=0,
+        lora_dropout=0, # set to zero to see identical loss on all ranks
     )
 
     model = LoraModel(model, lora_config, ADAPTER_NAME)
 
     timer.report(f"PEFT model: {count_trainable_parameters(model)}")
 
+    # wrap model in FSDP
     my_auto_wrap_policy = functools.partial(
         size_based_auto_wrap_policy, min_num_params=1_000
     )
@@ -194,8 +103,8 @@ if __name__ == "__main__":
         mixed_precision=bfSixteen_policy,
         cpu_offload=CPUOffload(offload_params=True),
         device_id=torch.cuda.current_device(),
-        param_init_fn=lambda mod: mod.to_empty(device=torch.cuda.current_device(), recurse=False),
-        sync_module_states=True,
+        param_init_fn=lambda mod: mod.to_empty(device=torch.cuda.current_device(), recurse=False), # for init from 'meta' device
+        sync_module_states=True, # broadcast model weights from main rank
         device_mesh=device_mesh
     )
 
@@ -203,31 +112,50 @@ if __name__ == "__main__":
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
 
-    # Load and prepare the dataset
-    raw_dataset = load_dataset(
-    "Salesforce/xlam-function-calling-60k",
-    token=HF_TOKEN,
-    # token=os.environ['HF_TOKEN'],
-    verification_mode="no_checks",
-    data_files="xlam_function_calling_60k.json",
-    streaming=True
+    # prepare dataset and utilities
+    dataset = load_dataset("leockl/xlam-function-calling-60k_langchain_langgraph", split="train")
+
+    def preprocess_function(examples):
+        # Combine input and target text
+        texts = [f"Question: {input_text}\nAnswer: {target_text}" for input_text, target_text in zip(examples['input_text'], examples['target_text'])]
+        
+        # Tokenize with padding and truncation
+        encodings = tokenizer(
+            texts,
+            truncation=True,
+            max_length=512,
+            padding="max_length",
+            return_tensors=None
+        )
+        
+        # Create labels for causal language modeling (shift input_ids right)
+        encodings["labels"] = encodings["input_ids"].copy()
+        
+        return encodings
+
+    # Process dataset
+    tokenized_dataset = dataset.map(
+        preprocess_function,
+        batched=True,
+        remove_columns=dataset.column_names,
+        desc="Tokenizing and preprocessing dataset",
     )
 
-    train_dataset = raw_dataset["train"].shard(num_shards=world_size, index=rank) # Sharding
+    # Create dataloader
+    def collate_fn(batch):
+        return {
+            'input_ids': torch.stack([torch.tensor(x['input_ids']) for x in batch]),
+            'attention_mask': torch.stack([torch.tensor(x['attention_mask']) for x in batch]),
+            'labels': torch.stack([torch.tensor(x['labels']) for x in batch])
+        }
+    
+    train_sampler = InterruptableDistributedSampler(tokenized_dataset)
 
-    dataset = FunctionCallingDataset(train_dataset, tokenizer)
-
-    train_sampler = InterruptableDistributedSampler(dataset)
-
-    batch_size = 2
+    batch_size = 4  # Adjust based on your GPU memory
     dataloader = DataLoader(
-        dataset,  # Use the dataset created on each rank
+        tokenized_dataset,
         batch_size=batch_size,
-        collate_fn=lambda x: {
-            'input_ids': torch.stack([s['input_ids'] for s in x]),
-            'attention_mask': torch.stack([s['attention_mask'] for s in x]),
-            'labels': torch.stack([s['labels'] for s in x])
-        },
+        collate_fn=collate_fn,
         sampler=train_sampler
     )
 
@@ -250,18 +178,23 @@ if __name__ == "__main__":
     model.train()
 
     for epoch in range(dataloader.sampler.epoch, num_epochs):
+
         dataloader.sampler.set_epoch(epoch)
 
         for step, batch in enumerate(dataloader):
+
             is_save_step = (step + 1) % save_every == 0
             if is_save_step:
                 checkpoint_directory = saver.prepare_checkpoint_directory()
+
                 timer.report("Prepared checkpoint directory")
 
+            # Move batch to device
             input_ids = batch["input_ids"].to(torch.cuda.current_device())
             attention_mask = batch["attention_mask"].to(torch.cuda.current_device())
             labels = batch["labels"].to(torch.cuda.current_device())
 
+            # forward, backward, update
             outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
             loss = outputs.loss
             loss.backward()
@@ -279,6 +212,7 @@ if __name__ == "__main__":
                 }, os.path.join(checkpoint_directory, "train_state.pt"))
 
                 saver.atomic_symlink(checkpoint_directory)
+
                 timer.report("Saved checkpoint")
 
         dataloader.sampler.reset_progress()
